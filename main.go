@@ -6,6 +6,7 @@ import (
 	"image"
 	_ "image/png"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -23,18 +25,30 @@ import (
 )
 
 type AppUI struct {
-	app           fyne.App
-	window        fyne.Window
-	client        *adb.Client
-	serial        string
-	deviceLabel   *widget.Label
-	batteryLabel  *widget.Label
-	statusLabel   *widget.Label
-	screenshotImg *canvas.Image
-	appList       *widget.List
-	allApps       []string
-	includeSystem bool
-	selectedApp   string
+	app            fyne.App
+	window         fyne.Window
+	client         *adb.Client
+	serial         string
+	deviceLabel    *widget.Label
+	batteryLabel   *widget.Label
+	statusLabel    *widget.Label
+	screenshotImg  *canvas.Image
+	appList        *widget.List
+	allApps        []string
+	includeSystem  bool
+	selectedApp    string
+	// files
+	filePathEntry  *widget.Entry
+	fileList       *widget.List
+	fileEntries    []adb.FileEntry
+	currentPath    string
+	selectedFile   *adb.FileEntry
+	// apk
+	apkPathEntry   *widget.Entry
+	uninstallList  *widget.List
+	uninstallPkgs  []string
+	selectedUninst string
+	optR, optD, optG bool
 }
 
 func main() {
@@ -46,13 +60,10 @@ func main() {
 	a := app.NewWithID("com.kekih.adbphonecontroller")
 	a.Settings().SetTheme(theme.DarkTheme())
 	w := a.NewWindow("ADB Phone Controller (Go + Fyne)")
-	w.Resize(fyne.NewSize(1100, 750))
+	w.Resize(fyne.NewSize(1150, 780))
 	w.SetMaster()
 
-	ui := &AppUI{
-		app:    a,
-		window: w,
-	}
+	ui := &AppUI{app: a, window: w, currentPath: "/sdcard"}
 	ui.build()
 	w.ShowAndRun()
 }
@@ -79,13 +90,14 @@ func (ui *AppUI) build() {
 		container.NewTabItem("Screen", ui.buildScreenTab()),
 		container.NewTabItem("Control", ui.buildControlTab()),
 		container.NewTabItem("Apps", ui.buildAppsTab()),
+		container.NewTabItem("Files", ui.buildFilesTab()),
+		container.NewTabItem("APK", ui.buildAPKTab()),
 		container.NewTabItem("Wi-Fi ADB", ui.buildWifiTab()),
 	)
 	tabs.SetTabLocation(container.TabLocationTop)
 
 	statusBar := container.NewHBox(ui.statusLabel)
-	content := container.NewBorder(header, statusBar, nil, nil, tabs)
-	ui.window.SetContent(content)
+	ui.window.SetContent(container.NewBorder(header, statusBar, nil, nil, tabs))
 
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -99,24 +111,19 @@ func (ui *AppUI) showDeviceDialog() {
 		dialog.ShowError(err, ui.window)
 		return
 	}
-
 	if len(devices) == 0 {
-		dialog.ShowInformation("No devices", "No devices found.\nConnect a phone via USB (with USB debugging enabled) and try again.", ui.window)
+		dialog.ShowInformation("No devices", "No devices found.\nConnect a phone via USB (USB debugging on) and try again.", ui.window)
 		return
 	}
-
-	var options []string
-	var serials []string
+	var options, serials []string
 	for _, d := range devices {
-		state := d.State
-		if state == "device" {
-			state = "ready"
+		st := d.State
+		if st == "device" {
+			st = "ready"
 		}
-		label := fmt.Sprintf("%s  |  %s  |  %s", d.Serial, d.Model, state)
-		options = append(options, label)
+		options = append(options, fmt.Sprintf("%s  |  %s  |  %s", d.Serial, d.Model, st))
 		serials = append(serials, d.Serial)
 	}
-
 	selected := 0
 	list := widget.NewRadioGroup(options, func(s string) {
 		for i, o := range options {
@@ -127,7 +134,6 @@ func (ui *AppUI) showDeviceDialog() {
 		}
 	})
 	list.SetSelected(options[0])
-
 	d := dialog.NewCustomConfirm("Select device", "Connect", "Cancel", list, func(ok bool) {
 		if !ok {
 			return
@@ -135,7 +141,7 @@ func (ui *AppUI) showDeviceDialog() {
 		serial := serials[selected]
 		for _, d := range devices {
 			if d.Serial == serial && d.State != "device" {
-				dialog.ShowInformation("Unavailable", "This device is not ready: "+d.State, ui.window)
+				dialog.ShowInformation("Unavailable", "Device not ready: "+d.State, ui.window)
 				return
 			}
 		}
@@ -151,6 +157,8 @@ func (ui *AppUI) setDevice(serial string) {
 	ui.deviceLabel.SetText("Device: " + serial)
 	ui.refreshHeader()
 	ui.refreshAppList()
+	ui.refreshFileList()
+	ui.refreshUninstallList()
 	ui.setStatus("Connected: " + serial)
 }
 
@@ -178,17 +186,16 @@ func (ui *AppUI) refreshHeader() {
 	}()
 }
 
-// ---------- Screen tab ----------
+// ---------- Screen ----------
 
 func (ui *AppUI) buildScreenTab() fyne.CanvasObject {
 	ui.screenshotImg = canvas.NewImageFromImage(nil)
 	ui.screenshotImg.FillMode = canvas.ImageFillContain
 	ui.screenshotImg.SetMinSize(fyne.NewSize(400, 600))
-
-	btnShot := widget.NewButton("Take screenshot", ui.takeScreenshot)
-	btnSave := widget.NewButton("Save PNG...", ui.saveScreenshot)
-
-	controls := container.NewHBox(btnShot, btnSave)
+	controls := container.NewHBox(
+		widget.NewButton("Take screenshot", ui.takeScreenshot),
+		widget.NewButton("Save PNG...", ui.saveScreenshot),
+	)
 	return container.NewBorder(controls, nil, nil, nil, ui.screenshotImg)
 }
 
@@ -217,7 +224,6 @@ func (ui *AppUI) takeScreenshot() {
 
 func (ui *AppUI) saveScreenshot() {
 	if ui.client == nil {
-		dialog.ShowInformation("No device", "Select a device first", ui.window)
 		return
 	}
 	dialog.ShowFileSave(func(uc fyne.URIWriteCloser, err error) {
@@ -230,8 +236,7 @@ func (ui *AppUI) saveScreenshot() {
 			ui.setStatus("Save failed: " + err.Error())
 			return
 		}
-		_, err = uc.Write(data)
-		if err != nil {
+		if _, err = uc.Write(data); err != nil {
 			ui.setStatus("Write failed: " + err.Error())
 			return
 		}
@@ -239,7 +244,7 @@ func (ui *AppUI) saveScreenshot() {
 	}, ui.window)
 }
 
-// ---------- Control tab ----------
+// ---------- Control ----------
 
 func (ui *AppUI) buildControlTab() fyne.CanvasObject {
 	keys := container.NewGridWithColumns(3,
@@ -250,62 +255,51 @@ func (ui *AppUI) buildControlTab() fyne.CanvasObject {
 		widget.NewButton("Vol +", func() { ui.pressKey(24) }),
 		widget.NewButton("Vol −", func() { ui.pressKey(25) }),
 	)
-
 	textEntry := widget.NewEntry()
-	textEntry.SetPlaceHolder("Text to send to device...")
-	sendTextBtn := widget.NewButton("Send text", func() {
-		if ui.client == nil {
+	textEntry.SetPlaceHolder("Text to send...")
+	sendBtn := widget.NewButton("Send text", func() {
+		if ui.client == nil || textEntry.Text == "" {
 			return
 		}
 		t := textEntry.Text
-		if t == "" {
-			return
-		}
 		go func() {
-			err := ui.client.InputText(t)
-			if err != nil {
+			if err := ui.client.InputText(t); err != nil {
 				ui.setStatus(err.Error())
 			} else {
 				ui.setStatus("Text sent")
 			}
 		}()
 	})
-
-	tapX := widget.NewEntry()
+	tapX, tapY := widget.NewEntry(), widget.NewEntry()
 	tapX.SetText("500")
-	tapY := widget.NewEntry()
 	tapY.SetText("1000")
 	tapBtn := widget.NewButton("Tap", func() {
 		if ui.client == nil {
 			return
 		}
-		x, err1 := strconv.Atoi(strings.TrimSpace(tapX.Text))
-		y, err2 := strconv.Atoi(strings.TrimSpace(tapY.Text))
-		if err1 != nil || err2 != nil {
+		x, e1 := strconv.Atoi(strings.TrimSpace(tapX.Text))
+		y, e2 := strconv.Atoi(strings.TrimSpace(tapY.Text))
+		if e1 != nil || e2 != nil {
 			ui.setStatus("Invalid coordinates")
 			return
 		}
 		go func() {
-			err := ui.client.Tap(x, y)
-			if err != nil {
+			if err := ui.client.Tap(x, y); err != nil {
 				ui.setStatus(err.Error())
 			} else {
 				ui.setStatus(fmt.Sprintf("Tapped %d,%d", x, y))
 			}
 		}()
 	})
-
-	form := container.NewVBox(
-		widget.NewLabel("Device buttons"),
-		keys,
+	return container.NewPadded(container.NewVBox(
+		widget.NewLabel("Device buttons"), keys,
 		widget.NewSeparator(),
 		widget.NewLabel("Text input"),
-		container.NewBorder(nil, nil, nil, sendTextBtn, textEntry),
+		container.NewBorder(nil, nil, nil, sendBtn, textEntry),
 		widget.NewSeparator(),
 		widget.NewLabel("Tap by coordinates"),
 		container.NewHBox(widget.NewLabel("X"), tapX, widget.NewLabel("Y"), tapY, tapBtn),
-	)
-	return container.NewPadded(form)
+	))
 }
 
 func (ui *AppUI) pressKey(code int) {
@@ -313,8 +307,7 @@ func (ui *AppUI) pressKey(code int) {
 		return
 	}
 	go func() {
-		err := ui.client.PressKey(code)
-		if err != nil {
+		if err := ui.client.PressKey(code); err != nil {
 			ui.setStatus(err.Error())
 		} else {
 			ui.setStatus("Key sent")
@@ -322,30 +315,27 @@ func (ui *AppUI) pressKey(code int) {
 	}()
 }
 
-// ---------- Apps tab ----------
+// ---------- Apps ----------
 
 func (ui *AppUI) buildAppsTab() fyne.CanvasObject {
 	includeCheck := widget.NewCheck("Show system apps", func(v bool) {
 		ui.includeSystem = v
 		ui.refreshAppList()
 	})
-	refreshBtn := widget.NewButton("Refresh list", ui.refreshAppList)
-	openBtn := widget.NewButton("Open selected", ui.openSelectedApp)
-
 	ui.appList = widget.NewList(
 		func() int { return len(ui.allApps) },
 		func() fyne.CanvasObject { return widget.NewLabel("template") },
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			o.(*widget.Label).SetText(ui.allApps[i])
-		},
+		func(i widget.ListItemID, o fyne.CanvasObject) { o.(*widget.Label).SetText(ui.allApps[i]) },
 	)
 	ui.appList.OnSelected = func(id widget.ListItemID) {
 		if id >= 0 && id < len(ui.allApps) {
 			ui.selectedApp = ui.allApps[id]
 		}
 	}
-
-	top := container.NewHBox(includeCheck, refreshBtn, openBtn)
+	top := container.NewHBox(includeCheck,
+		widget.NewButton("Refresh", ui.refreshAppList),
+		widget.NewButton("Open selected", ui.openSelectedApp),
+	)
 	return container.NewBorder(top, nil, nil, nil, ui.appList)
 }
 
@@ -368,18 +358,14 @@ func (ui *AppUI) refreshAppList() {
 }
 
 func (ui *AppUI) openSelectedApp() {
-	if ui.client == nil {
-		return
-	}
-	if ui.selectedApp == "" {
+	if ui.client == nil || ui.selectedApp == "" {
 		ui.setStatus("Select an app first")
 		return
 	}
 	pkg := ui.selectedApp
 	ui.setStatus("Opening " + pkg + "...")
 	go func() {
-		err := ui.client.OpenApp(pkg)
-		if err != nil {
+		if err := ui.client.OpenApp(pkg); err != nil {
 			ui.setStatus(err.Error())
 		} else {
 			ui.setStatus("Opened " + pkg)
@@ -387,15 +373,327 @@ func (ui *AppUI) openSelectedApp() {
 	}()
 }
 
-// ---------- Wi-Fi tab ----------
+// ---------- Files ----------
+
+func (ui *AppUI) buildFilesTab() fyne.CanvasObject {
+	ui.filePathEntry = widget.NewEntry()
+	ui.filePathEntry.SetText("/sdcard")
+	ui.filePathEntry.OnSubmitted = func(s string) { ui.navigateFiles(s) }
+
+	ui.fileList = widget.NewList(
+		func() int { return len(ui.fileEntries) },
+		func() fyne.CanvasObject {
+			return container.NewHBox(widget.NewLabel("name"), layout.NewSpacer(), widget.NewLabel("size"))
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			e := ui.fileEntries[i]
+			box := o.(*fyne.Container)
+			name := e.Name
+			if e.IsDir {
+				name = "📁 " + name
+			}
+			box.Objects[0].(*widget.Label).SetText(name)
+			sizeLbl := box.Objects[2].(*widget.Label)
+			if e.IsDir {
+				sizeLbl.SetText("")
+			} else {
+				sizeLbl.SetText(adb.HumanSize(e.Size))
+			}
+		},
+	)
+	ui.fileList.OnSelected = func(id widget.ListItemID) {
+		if id >= 0 && id < len(ui.fileEntries) {
+			ui.selectedFile = &ui.fileEntries[id]
+		}
+	}
+	ui.fileList.OnDoubleTapped = func(id widget.ListItemID) {
+		if id >= 0 && id < len(ui.fileEntries) {
+			e := ui.fileEntries[id]
+			if e.IsDir {
+				ui.navigateFiles(e.Path)
+			}
+		}
+	}
+
+	nav := container.NewBorder(nil, nil,
+		container.NewHBox(
+			widget.NewButton("↑ Up", ui.fileGoUp),
+			widget.NewButton("/sdcard", func() { ui.navigateFiles("/sdcard") }),
+		),
+		widget.NewButton("Go", func() { ui.navigateFiles(ui.filePathEntry.Text) }),
+		ui.filePathEntry,
+	)
+	actions := container.NewHBox(
+		widget.NewButton("Download", ui.fileDownload),
+		widget.NewButton("Upload...", ui.fileUpload),
+		widget.NewButton("Delete", ui.fileDelete),
+		widget.NewButton("New folder", ui.fileMkdir),
+		widget.NewButton("Refresh", ui.refreshFileList),
+	)
+	return container.NewBorder(container.NewVBox(nav, actions), nil, nil, nil, ui.fileList)
+}
+
+func (ui *AppUI) navigateFiles(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "/sdcard"
+	}
+	ui.currentPath = path
+	ui.filePathEntry.SetText(path)
+	ui.refreshFileList()
+}
+
+func (ui *AppUI) refreshFileList() {
+	if ui.client == nil {
+		return
+	}
+	ui.setStatus("Reading " + ui.currentPath + "...")
+	go func() {
+		items, err := ui.client.ListFiles(ui.currentPath)
+		if err != nil {
+			ui.setStatus(err.Error())
+			return
+		}
+		ui.fileEntries = items
+		ui.selectedFile = nil
+		ui.fileList.Refresh()
+		ui.setStatus(fmt.Sprintf("%d items in %s", len(items), ui.currentPath))
+	}()
+}
+
+func (ui *AppUI) fileGoUp() {
+	if ui.currentPath == "/" {
+		return
+	}
+	parent := filepath.Dir(strings.TrimRight(ui.currentPath, "/"))
+	if parent == "." || parent == "" {
+		parent = "/"
+	}
+	ui.navigateFiles(parent)
+}
+
+func (ui *AppUI) fileDownload() {
+	if ui.client == nil || ui.selectedFile == nil || ui.selectedFile.IsDir {
+		ui.setStatus("Select a file to download")
+		return
+	}
+	remote := ui.selectedFile.Path
+	name := ui.selectedFile.Name
+	dialog.ShowFileSave(func(uc fyne.URIWriteCloser, err error) {
+		if err != nil || uc == nil {
+			return
+		}
+		local := uc.URI().Path()
+		uc.Close()
+		ui.setStatus("Downloading...")
+		go func() {
+			if err := ui.client.PullFile(remote, local); err != nil {
+				ui.setStatus(err.Error())
+			} else {
+				ui.setStatus("Downloaded: " + local)
+			}
+		}()
+	}, ui.window)
+	// set suggested name
+	_ = name
+}
+
+func (ui *AppUI) fileUpload() {
+	if ui.client == nil {
+		return
+	}
+	fd := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
+		if err != nil || uc == nil {
+			return
+		}
+		local := uc.URI().Path()
+		uc.Close()
+		remote := strings.TrimRight(ui.currentPath, "/") + "/" + filepath.Base(local)
+		ui.setStatus("Uploading...")
+		go func() {
+			if err := ui.client.PushFile(local, remote); err != nil {
+				ui.setStatus(err.Error())
+			} else {
+				ui.setStatus("Uploaded: " + remote)
+				ui.refreshFileList()
+			}
+		}()
+	}, ui.window)
+	fd.Show()
+}
+
+func (ui *AppUI) fileDelete() {
+	if ui.client == nil || ui.selectedFile == nil {
+		ui.setStatus("Select item to delete")
+		return
+	}
+	path := ui.selectedFile.Path
+	dialog.ShowConfirm("Delete", "Delete "+path+"?", func(ok bool) {
+		if !ok {
+			return
+		}
+		go func() {
+			if err := ui.client.DeletePath(path); err != nil {
+				ui.setStatus(err.Error())
+			} else {
+				ui.setStatus("Deleted")
+				ui.refreshFileList()
+			}
+		}()
+	}, ui.window)
+}
+
+func (ui *AppUI) fileMkdir() {
+	if ui.client == nil {
+		return
+	}
+	entry := widget.NewEntry()
+	dialog.ShowForm("New folder", "Create", "Cancel", []*widget.FormItem{
+		widget.NewFormItem("Name", entry),
+	}, func(ok bool) {
+		if !ok || strings.TrimSpace(entry.Text) == "" {
+			return
+		}
+		newPath := strings.TrimRight(ui.currentPath, "/") + "/" + strings.TrimSpace(entry.Text)
+		go func() {
+			if err := ui.client.Mkdir(newPath); err != nil {
+				ui.setStatus(err.Error())
+			} else {
+				ui.setStatus("Folder created")
+				ui.refreshFileList()
+			}
+		}()
+	}, ui.window)
+}
+
+// ---------- APK ----------
+
+func (ui *AppUI) buildAPKTab() fyne.CanvasObject {
+	ui.apkPathEntry = widget.NewEntry()
+	ui.apkPathEntry.SetPlaceHolder("Path to .apk file")
+	browseBtn := widget.NewButton("Browse...", func() {
+		fd := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			ui.apkPathEntry.SetText(uc.URI().Path())
+			uc.Close()
+		}, ui.window)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".apk"}))
+		fd.Show()
+	})
+	optR := widget.NewCheck("-r reinstall (keep data)", func(v bool) { ui.optR = v })
+	optD := widget.NewCheck("-d allow downgrade", func(v bool) { ui.optD = v })
+	optG := widget.NewCheck("-g grant all permissions", func(v bool) { ui.optG = v })
+	installBtn := widget.NewButton("Install APK", ui.installAPK)
+
+	installBox := container.NewVBox(
+		widget.NewLabel("Install APK"),
+		container.NewBorder(nil, nil, nil, browseBtn, ui.apkPathEntry),
+		optR, optD, optG,
+		installBtn,
+	)
+
+	ui.uninstallList = widget.NewList(
+		func() int { return len(ui.uninstallPkgs) },
+		func() fyne.CanvasObject { return widget.NewLabel("pkg") },
+		func(i widget.ListItemID, o fyne.CanvasObject) { o.(*widget.Label).SetText(ui.uninstallPkgs[i]) },
+	)
+	ui.uninstallList.OnSelected = func(id widget.ListItemID) {
+		if id >= 0 && id < len(ui.uninstallPkgs) {
+			ui.selectedUninst = ui.uninstallPkgs[id]
+		}
+	}
+	uninstTop := container.NewHBox(
+		widget.NewButton("Refresh packages", ui.refreshUninstallList),
+		widget.NewButton("Uninstall", func() { ui.doUninstall(false) }),
+		widget.NewButton("Uninstall (keep data)", func() { ui.doUninstall(true) }),
+	)
+	uninstallBox := container.NewBorder(
+		container.NewVBox(widget.NewLabel("Uninstall packages"), uninstTop),
+		nil, nil, nil, ui.uninstallList,
+	)
+
+	split := container.NewHSplit(container.NewPadded(installBox), uninstallBox)
+	split.SetOffset(0.4)
+	return split
+}
+
+func (ui *AppUI) installAPK() {
+	if ui.client == nil {
+		return
+	}
+	path := strings.TrimSpace(ui.apkPathEntry.Text)
+	if path == "" {
+		ui.setStatus("Select an APK file")
+		return
+	}
+	var opts []string
+	if ui.optR {
+		opts = append(opts, "-r")
+	}
+	if ui.optD {
+		opts = append(opts, "-d")
+	}
+	if ui.optG {
+		opts = append(opts, "-g")
+	}
+	ui.setStatus("Installing...")
+	go func() {
+		if err := ui.client.InstallAPK(path, opts); err != nil {
+			ui.setStatus(err.Error())
+		} else {
+			ui.setStatus("Install OK: " + filepath.Base(path))
+			ui.refreshUninstallList()
+		}
+	}()
+}
+
+func (ui *AppUI) refreshUninstallList() {
+	if ui.client == nil {
+		return
+	}
+	go func() {
+		pkgs, err := ui.client.ListPackages(false)
+		if err != nil {
+			ui.setStatus(err.Error())
+			return
+		}
+		ui.uninstallPkgs = pkgs
+		ui.selectedUninst = ""
+		ui.uninstallList.Refresh()
+	}()
+}
+
+func (ui *AppUI) doUninstall(keepData bool) {
+	if ui.client == nil || ui.selectedUninst == "" {
+		ui.setStatus("Select a package")
+		return
+	}
+	pkg := ui.selectedUninst
+	dialog.ShowConfirm("Uninstall", "Uninstall "+pkg+"?", func(ok bool) {
+		if !ok {
+			return
+		}
+		go func() {
+			if err := ui.client.UninstallPackage(pkg, keepData); err != nil {
+				ui.setStatus(err.Error())
+			} else {
+				ui.setStatus("Uninstalled " + pkg)
+				ui.refreshUninstallList()
+			}
+		}()
+	}, ui.window)
+}
+
+// ---------- Wi-Fi ----------
 
 func (ui *AppUI) buildWifiTab() fyne.CanvasObject {
 	ipEntry := widget.NewEntry()
 	ipEntry.SetPlaceHolder("192.168.1.100")
 	portEntry := widget.NewEntry()
 	portEntry.SetText("5555")
-
-	enableBtn := widget.NewButton("Enable TCP/IP (current USB device)", func() {
+	enableBtn := widget.NewButton("Enable TCP/IP (current USB)", func() {
 		if ui.client == nil {
 			ui.setStatus("Select USB device first")
 			return
@@ -413,7 +711,6 @@ func (ui *AppUI) buildWifiTab() fyne.CanvasObject {
 			}
 		}()
 	})
-
 	connectBtn := widget.NewButton("Connect", func() {
 		ip := strings.TrimSpace(ipEntry.Text)
 		port := strings.TrimSpace(portEntry.Text)
@@ -424,9 +721,8 @@ func (ui *AppUI) buildWifiTab() fyne.CanvasObject {
 			ui.setStatus("Enter IP")
 			return
 		}
-		target := ip + ":" + port
 		go func() {
-			msg, err := adb.ConnectWifi(target)
+			msg, err := adb.ConnectWifi(ip + ":" + port)
 			if err != nil {
 				ui.setStatus(msg + " / " + err.Error())
 			} else {
@@ -434,16 +730,13 @@ func (ui *AppUI) buildWifiTab() fyne.CanvasObject {
 			}
 		}()
 	})
-
-	form := container.NewVBox(
+	return container.NewPadded(container.NewVBox(
 		widget.NewLabel("Wi-Fi ADB"),
 		widget.NewForm(
 			widget.NewFormItem("IP", ipEntry),
 			widget.NewFormItem("Port", portEntry),
 		),
-		enableBtn,
-		connectBtn,
-		widget.NewLabel("After enabling TCP/IP on USB, disconnect USB and connect via IP."),
-	)
-	return container.NewPadded(form)
+		enableBtn, connectBtn,
+		widget.NewLabel("After enabling TCP/IP, disconnect USB and connect by IP."),
+	))
 }
