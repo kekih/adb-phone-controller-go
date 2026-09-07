@@ -23,17 +23,18 @@ import (
 )
 
 type AppUI struct {
-	app        fyne.App
-	window     fyne.Window
-	client     *adb.Client
-	serial     string
-	deviceLabel *widget.Label
-	batteryLabel *widget.Label
-	statusLabel *widget.Label
+	app           fyne.App
+	window        fyne.Window
+	client        *adb.Client
+	serial        string
+	deviceLabel   *widget.Label
+	batteryLabel  *widget.Label
+	statusLabel   *widget.Label
 	screenshotImg *canvas.Image
-	appList    *widget.List
-	allApps    []string
+	appList       *widget.List
+	allApps       []string
 	includeSystem bool
+	selectedApp   string
 }
 
 func main() {
@@ -74,7 +75,6 @@ func (ui *AppUI) build() {
 		widget.NewButton("Change device", ui.showDeviceDialog),
 	)
 
-	// Tabs
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Screen", ui.buildScreenTab()),
 		container.NewTabItem("Control", ui.buildControlTab()),
@@ -87,10 +87,8 @@ func (ui *AppUI) build() {
 	content := container.NewBorder(header, statusBar, nil, nil, tabs)
 	ui.window.SetContent(content)
 
-	// Show device dialog on start
-	ui.window.Canvas().AddShortcut(&fyne.Shortcut{KeyName: ""}, nil) // noop
 	go func() {
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 		ui.showDeviceDialog()
 	}()
 }
@@ -135,7 +133,6 @@ func (ui *AppUI) showDeviceDialog() {
 			return
 		}
 		serial := serials[selected]
-		// Only allow "device" state
 		for _, d := range devices {
 			if d.Serial == serial && d.State != "device" {
 				dialog.ShowInformation("Unavailable", "This device is not ready: "+d.State, ui.window)
@@ -219,8 +216,8 @@ func (ui *AppUI) takeScreenshot() {
 }
 
 func (ui *AppUI) saveScreenshot() {
-	if ui.screenshotImg.Image == nil {
-		dialog.ShowInformation("No image", "Take a screenshot first", ui.window)
+	if ui.client == nil {
+		dialog.ShowInformation("No device", "Select a device first", ui.window)
 		return
 	}
 	dialog.ShowFileSave(func(uc fyne.URIWriteCloser, err error) {
@@ -228,7 +225,6 @@ func (ui *AppUI) saveScreenshot() {
 			return
 		}
 		defer uc.Close()
-		// Re-take to get fresh PNG bytes (simpler than re-encoding)
 		data, err := ui.client.ScreenshotPNG(20 * time.Second)
 		if err != nil {
 			ui.setStatus("Save failed: " + err.Error())
@@ -344,7 +340,9 @@ func (ui *AppUI) buildAppsTab() fyne.CanvasObject {
 		},
 	)
 	ui.appList.OnSelected = func(id widget.ListItemID) {
-		// keep selection for open
+		if id >= 0 && id < len(ui.allApps) {
+			ui.selectedApp = ui.allApps[id]
+		}
 	}
 
 	top := container.NewHBox(includeCheck, refreshBtn, openBtn)
@@ -363,6 +361,7 @@ func (ui *AppUI) refreshAppList() {
 			return
 		}
 		ui.allApps = pkgs
+		ui.selectedApp = ""
 		ui.appList.Refresh()
 		ui.setStatus(fmt.Sprintf("Loaded %d packages", len(pkgs)))
 	}()
@@ -372,33 +371,18 @@ func (ui *AppUI) openSelectedApp() {
 	if ui.client == nil {
 		return
 	}
-	id := ui.appList // no direct selected getter in older Fyne; use a simple approach
-	// For simplicity we open the first selected via a stored index
-	// Fyne List doesn't expose selected easily in all versions; use OnSelected to store.
-	// Quick fix: open by asking user or keep last selected.
-	// We'll store last selected.
-}
-
-var lastSelectedApp string
-
-func init() {
-	// placeholder – will set properly below
-}
-
-// Fix openSelectedApp properly in the build
-
-func (ui *AppUI) openSelectedAppFixed() {
-	if ui.client == nil || lastSelectedApp == "" {
+	if ui.selectedApp == "" {
 		ui.setStatus("Select an app first")
 		return
 	}
-	ui.setStatus("Opening " + lastSelectedApp + "...")
+	pkg := ui.selectedApp
+	ui.setStatus("Opening " + pkg + "...")
 	go func() {
-		err := ui.client.OpenApp(lastSelectedApp)
+		err := ui.client.OpenApp(pkg)
 		if err != nil {
 			ui.setStatus(err.Error())
 		} else {
-			ui.setStatus("Opened " + lastSelectedApp)
+			ui.setStatus("Opened " + pkg)
 		}
 	}()
 }
@@ -447,7 +431,6 @@ func (ui *AppUI) buildWifiTab() fyne.CanvasObject {
 				ui.setStatus(msg + " / " + err.Error())
 			} else {
 				ui.setStatus(msg)
-				// refresh device list after connect
 			}
 		}()
 	})
