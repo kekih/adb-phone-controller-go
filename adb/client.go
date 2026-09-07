@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -20,6 +21,15 @@ type Device struct {
 // Client is bound to a specific device serial.
 type Client struct {
 	Serial string
+}
+
+// FileEntry describes a file or directory on the device.
+type FileEntry struct {
+	Name        string
+	IsDir       bool
+	Size        int64
+	Permissions string
+	Path        string
 }
 
 // AdbAvailable checks if adb is in PATH.
@@ -219,7 +229,6 @@ func (c *Client) Tap(x, y int) error {
 
 // InputText sends text (basic escaping).
 func (c *Client) InputText(text string) error {
-	// Basic sanitization similar to original, but improved a bit.
 	safe := strings.ReplaceAll(text, "\\", "")
 	safe = strings.ReplaceAll(safe, "'", "")
 	safe = strings.ReplaceAll(safe, "\"", "")
@@ -253,4 +262,147 @@ func EnableTCPIP(serial string, port int) (string, error) {
 		return msg, err
 	}
 	return msg, nil
+}
+
+// ---------- Files ----------
+
+// ListFiles lists directory contents on the device.
+func (c *Client) ListFiles(path string) ([]FileEntry, error) {
+	if path == "" {
+		path = "/sdcard"
+	}
+	out, errStr, code := c.Shell("ls", "-la", path)
+	if code != 0 {
+		return nil, fmt.Errorf("ls failed: %s", errStr)
+	}
+	var items []FileEntry
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "total") || strings.HasPrefix(line, "ls:") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 6 {
+			continue
+		}
+		perms := parts[0]
+		if len(perms) < 10 || (perms[0] != 'd' && perms[0] != '-' && perms[0] != 'l' && perms[0] != 'b' && perms[0] != 'c') {
+			continue
+		}
+		isDir := perms[0] == 'd'
+		size := int64(0)
+		if n, err := strconv.ParseInt(strings.ReplaceAll(parts[4], ",", ""), 10, 64); err == nil {
+			size = n
+		}
+		name := parts[5]
+		if len(parts) > 6 {
+			name = strings.Join(parts[5:], " ")
+		}
+		if strings.Contains(name, " -> ") {
+			name = strings.Split(name, " -> ")[0]
+		}
+		if name == "." || name == ".." {
+			continue
+		}
+		full := strings.TrimRight(path, "/") + "/" + name
+		items = append(items, FileEntry{
+			Name: name, IsDir: isDir, Size: size, Permissions: perms, Path: full,
+		})
+	}
+	// dirs first
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if !items[i].IsDir && items[j].IsDir {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+	return items, nil
+}
+
+// PushFile uploads a local file to the device.
+func (c *Client) PushFile(localPath, remotePath string) error {
+	out, errStr, code := c.Raw([]string{"push", localPath, remotePath}, 5*time.Minute)
+	if code != 0 {
+		return fmt.Errorf("push failed: %s %s", out, errStr)
+	}
+	return nil
+}
+
+// PullFile downloads a file from the device.
+func (c *Client) PullFile(remotePath, localPath string) error {
+	out, errStr, code := c.Raw([]string{"pull", remotePath, localPath}, 5*time.Minute)
+	if code != 0 {
+		return fmt.Errorf("pull failed: %s %s", out, errStr)
+	}
+	return nil
+}
+
+// DeletePath removes a file or directory on the device.
+func (c *Client) DeletePath(remotePath string) error {
+	_, errStr, code := c.Shell("rm", "-r", remotePath)
+	if code != 0 {
+		return fmt.Errorf("rm failed: %s", errStr)
+	}
+	return nil
+}
+
+// Mkdir creates a directory on the device.
+func (c *Client) Mkdir(remotePath string) error {
+	_, errStr, code := c.Shell("mkdir", "-p", remotePath)
+	if code != 0 {
+		return fmt.Errorf("mkdir failed: %s", errStr)
+	}
+	return nil
+}
+
+// ---------- APK ----------
+
+// InstallAPK installs an APK with optional flags (e.g. -r -d -g).
+func (c *Client) InstallAPK(apkPath string, options []string) error {
+	args := append([]string{"install"}, options...)
+	args = append(args, apkPath)
+	out, errStr, code := c.Raw(args, 3*time.Minute)
+	if code != 0 {
+		return fmt.Errorf("install failed: %s %s", out, errStr)
+	}
+	return nil
+}
+
+// UninstallPackage uninstalls a package. keepData=true keeps data/cache.
+func (c *Client) UninstallPackage(pkg string, keepData bool) error {
+	args := []string{"uninstall"}
+	if keepData {
+		args = append(args, "-k")
+	}
+	args = append(args, pkg)
+	out, errStr, code := c.Raw(args, 60*time.Second)
+	if code != 0 {
+		return fmt.Errorf("uninstall failed: %s %s", out, errStr)
+	}
+	return nil
+}
+
+// HumanSize formats bytes.
+func HumanSize(n int64) string {
+	if n <= 0 {
+		return "0"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	f := float64(n)
+	for _, u := range units {
+		if f < 1024 {
+			if u == "B" {
+				return fmt.Sprintf("%.0f %s", f, u)
+			}
+			return fmt.Sprintf("%.1f %s", f, u)
+		}
+		f /= 1024
+	}
+	return fmt.Sprintf("%.1f PB", f)
+}
+
+// Basename is a thin wrapper.
+func Basename(p string) string {
+	return filepath.Base(p)
 }
