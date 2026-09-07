@@ -37,13 +37,11 @@ type AppUI struct {
 	allApps        []string
 	includeSystem  bool
 	selectedApp    string
-	// files
 	filePathEntry  *widget.Entry
 	fileList       *widget.List
 	fileEntries    []adb.FileEntry
 	currentPath    string
 	selectedFile   *adb.FileEntry
-	// apk
 	apkPathEntry   *widget.Entry
 	uninstallList  *widget.List
 	uninstallPkgs  []string
@@ -186,8 +184,6 @@ func (ui *AppUI) refreshHeader() {
 	}()
 }
 
-// ---------- Screen ----------
-
 func (ui *AppUI) buildScreenTab() fyne.CanvasObject {
 	ui.screenshotImg = canvas.NewImageFromImage(nil)
 	ui.screenshotImg.FillMode = canvas.ImageFillContain
@@ -243,8 +239,6 @@ func (ui *AppUI) saveScreenshot() {
 		ui.setStatus("Saved: " + uc.URI().Path())
 	}, ui.window)
 }
-
-// ---------- Control ----------
 
 func (ui *AppUI) buildControlTab() fyne.CanvasObject {
 	keys := container.NewGridWithColumns(3,
@@ -315,8 +309,6 @@ func (ui *AppUI) pressKey(code int) {
 	}()
 }
 
-// ---------- Apps ----------
-
 func (ui *AppUI) buildAppsTab() fyne.CanvasObject {
 	includeCheck := widget.NewCheck("Show system apps", func(v bool) {
 		ui.includeSystem = v
@@ -373,8 +365,6 @@ func (ui *AppUI) openSelectedApp() {
 	}()
 }
 
-// ---------- Files ----------
-
 func (ui *AppUI) buildFilesTab() fyne.CanvasObject {
 	ui.filePathEntry = widget.NewEntry()
 	ui.filePathEntry.SetText("/sdcard")
@@ -390,7 +380,7 @@ func (ui *AppUI) buildFilesTab() fyne.CanvasObject {
 			box := o.(*fyne.Container)
 			name := e.Name
 			if e.IsDir {
-				name = "📁 " + name
+				name = "[DIR] " + name
 			}
 			box.Objects[0].(*widget.Label).SetText(name)
 			sizeLbl := box.Objects[2].(*widget.Label)
@@ -406,19 +396,12 @@ func (ui *AppUI) buildFilesTab() fyne.CanvasObject {
 			ui.selectedFile = &ui.fileEntries[id]
 		}
 	}
-	ui.fileList.OnDoubleTapped = func(id widget.ListItemID) {
-		if id >= 0 && id < len(ui.fileEntries) {
-			e := ui.fileEntries[id]
-			if e.IsDir {
-				ui.navigateFiles(e.Path)
-			}
-		}
-	}
 
 	nav := container.NewBorder(nil, nil,
 		container.NewHBox(
-			widget.NewButton("↑ Up", ui.fileGoUp),
+			widget.NewButton("Up", ui.fileGoUp),
 			widget.NewButton("/sdcard", func() { ui.navigateFiles("/sdcard") }),
+			widget.NewButton("Open dir", ui.fileOpenDir),
 		),
 		widget.NewButton("Go", func() { ui.navigateFiles(ui.filePathEntry.Text) }),
 		ui.filePathEntry,
@@ -472,13 +455,18 @@ func (ui *AppUI) fileGoUp() {
 	ui.navigateFiles(parent)
 }
 
+func (ui *AppUI) fileOpenDir() {
+	if ui.selectedFile != nil && ui.selectedFile.IsDir {
+		ui.navigateFiles(ui.selectedFile.Path)
+	}
+}
+
 func (ui *AppUI) fileDownload() {
 	if ui.client == nil || ui.selectedFile == nil || ui.selectedFile.IsDir {
 		ui.setStatus("Select a file to download")
 		return
 	}
 	remote := ui.selectedFile.Path
-	name := ui.selectedFile.Name
 	dialog.ShowFileSave(func(uc fyne.URIWriteCloser, err error) {
 		if err != nil || uc == nil {
 			return
@@ -494,8 +482,6 @@ func (ui *AppUI) fileDownload() {
 			}
 		}()
 	}, ui.window)
-	// set suggested name
-	_ = name
 }
 
 func (ui *AppUI) fileUpload() {
@@ -565,8 +551,6 @@ func (ui *AppUI) fileMkdir() {
 		}()
 	}, ui.window)
 }
-
-// ---------- APK ----------
 
 func (ui *AppUI) buildAPKTab() fyne.CanvasObject {
 	ui.apkPathEntry = widget.NewEntry()
@@ -685,8 +669,6 @@ func (ui *AppUI) doUninstall(keepData bool) {
 		}()
 	}, ui.window)
 }
-
-// ---------- Wi-Fi ----------
 
 func (ui *AppUI) buildWifiTab() fyne.CanvasObject {
 	ipEntry := widget.NewEntry()
