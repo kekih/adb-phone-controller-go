@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -16,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
@@ -33,6 +36,7 @@ type AppUI struct {
 	batteryLabel   *widget.Label
 	statusLabel    *widget.Label
 	screenshotImg  *canvas.Image
+	screenWrap     *fyne.Container
 	appList        *widget.List
 	allApps        []string
 	includeSystem  bool
@@ -47,6 +51,17 @@ type AppUI struct {
 	uninstallPkgs  []string
 	selectedUninst string
 	optR, optD, optG bool
+
+	// live mirror
+	mirrorRunning  atomic.Bool
+	mirrorStop     chan struct{}
+	mirrorInterval time.Duration
+	mirrorBtn      *widget.Button
+	mirrorFPSLabel *widget.Label
+	sourceW, sourceH int
+	frameMu        sync.Mutex
+	lastFrame      image.Image
+	mirrorBusy     atomic.Bool
 }
 
 func main() {
@@ -61,8 +76,16 @@ func main() {
 	w.Resize(fyne.NewSize(1150, 780))
 	w.SetMaster()
 
-	ui := &AppUI{app: a, window: w, currentPath: "/sdcard"}
+	ui := &AppUI{
+		app:            a,
+		window:         w,
+		currentPath:    "/sdcard",
+		mirrorInterval: 400 * time.Millisecond,
+	}
 	ui.build()
+	w.SetOnClosed(func() {
+		ui.stopMirror()
+	})
 	w.ShowAndRun()
 }
 
@@ -150,6 +173,7 @@ func (ui *AppUI) showDeviceDialog() {
 }
 
 func (ui *AppUI) setDevice(serial string) {
+	ui.stopMirror()
 	ui.serial = serial
 	ui.client = &adb.Client{Serial: serial}
 	ui.deviceLabel.SetText("Device: " + serial)
@@ -184,15 +208,187 @@ func (ui *AppUI) refreshHeader() {
 	}()
 }
 
+// ---------- Screen (live mirror) ----------
+
 func (ui *AppUI) buildScreenTab() fyne.CanvasObject {
 	ui.screenshotImg = canvas.NewImageFromImage(nil)
 	ui.screenshotImg.FillMode = canvas.ImageFillContain
-	ui.screenshotImg.SetMinSize(fyne.NewSize(400, 600))
+	ui.screenshotImg.SetMinSize(fyne.NewSize(360, 640))
+
+	// Clickable overlay for tap
+	tappable := newTappableImage(ui.screenshotImg, ui.onScreenTap)
+
+	ui.mirrorBtn = widget.NewButton("▶ Start live mirror", ui.toggleMirror)
+	ui.mirrorFPSLabel = widget.NewLabel("Interval: 400ms")
+
+	intervalSel := widget.NewSelect([]string{"200ms (~5 FPS)", "300ms", "400ms", "500ms", "1s"}, func(s string) {
+		switch {
+		case strings.HasPrefix(s, "200"):
+			ui.mirrorInterval = 200 * time.Millisecond
+		case strings.HasPrefix(s, "300"):
+			ui.mirrorInterval = 300 * time.Millisecond
+		case strings.HasPrefix(s, "400"):
+			ui.mirrorInterval = 400 * time.Millisecond
+		case strings.HasPrefix(s, "500"):
+			ui.mirrorInterval = 500 * time.Millisecond
+		default:
+			ui.mirrorInterval = time.Second
+		}
+		ui.mirrorFPSLabel.SetText("Interval: " + s)
+	})
+	intervalSel.SetSelected("400ms")
+
 	controls := container.NewHBox(
-		widget.NewButton("Take screenshot", ui.takeScreenshot),
+		ui.mirrorBtn,
+		widget.NewButton("Single shot", ui.takeScreenshot),
 		widget.NewButton("Save PNG...", ui.saveScreenshot),
+		widget.NewLabel("Rate:"),
+		intervalSel,
+		ui.mirrorFPSLabel,
 	)
-	return container.NewBorder(controls, nil, nil, nil, ui.screenshotImg)
+	hint := widget.NewLabel("Click on the image to tap the device (while mirror or after a shot)")
+	hint.TextStyle = fyne.TextStyle{Italic: true}
+
+	ui.screenWrap = container.NewBorder(controls, hint, nil, nil, tappable)
+	return ui.screenWrap
+}
+
+func (ui *AppUI) toggleMirror() {
+	if ui.mirrorRunning.Load() {
+		ui.stopMirror()
+	} else {
+		ui.startMirror()
+	}
+}
+
+func (ui *AppUI) startMirror() {
+	if ui.client == nil {
+		dialog.ShowInformation("No device", "Select a device first", ui.window)
+		return
+	}
+	if ui.mirrorRunning.Load() {
+		return
+	}
+	ui.mirrorRunning.Store(true)
+	ui.mirrorStop = make(chan struct{})
+	ui.mirrorBtn.SetText("■ Stop live mirror")
+	ui.setStatus("Live mirror started")
+
+	go ui.mirrorLoop()
+}
+
+func (ui *AppUI) stopMirror() {
+	if !ui.mirrorRunning.Load() {
+		return
+	}
+	ui.mirrorRunning.Store(false)
+	if ui.mirrorStop != nil {
+		select {
+		case <-ui.mirrorStop:
+		default:
+			close(ui.mirrorStop)
+		}
+	}
+	if ui.mirrorBtn != nil {
+		ui.mirrorBtn.SetText("▶ Start live mirror")
+	}
+	ui.setStatus("Live mirror stopped")
+}
+
+func (ui *AppUI) mirrorLoop() {
+	frames := 0
+	lastFPS := time.Now()
+	for ui.mirrorRunning.Load() {
+		start := time.Now()
+		if ui.mirrorBusy.CompareAndSwap(false, true) {
+			data, err := ui.client.ScreenshotPNG(8 * time.Second)
+			ui.mirrorBusy.Store(false)
+			if err == nil && len(data) > 0 {
+				img, _, err := image.Decode(bytes.NewReader(data))
+				if err == nil {
+					b := img.Bounds()
+					ui.frameMu.Lock()
+					ui.lastFrame = img
+					ui.sourceW, ui.sourceH = b.Dx(), b.Dy()
+					ui.frameMu.Unlock()
+					ui.screenshotImg.Image = img
+					ui.screenshotImg.Refresh()
+					frames++
+				}
+			}
+		}
+		if time.Since(lastFPS) >= time.Second {
+			fps := frames
+			frames = 0
+			lastFPS = time.Now()
+			ui.frameMu.Lock()
+			w, h := ui.sourceW, ui.sourceH
+			ui.frameMu.Unlock()
+			if w > 0 {
+				ui.setStatus(fmt.Sprintf("Live mirror  •  %dx%d  •  ~%d FPS", w, h, fps))
+			}
+		}
+		elapsed := time.Since(start)
+		sleep := ui.mirrorInterval - elapsed
+		if sleep < 50*time.Millisecond {
+			sleep = 50 * time.Millisecond
+		}
+		select {
+		case <-ui.mirrorStop:
+			return
+		case <-time.After(sleep):
+		}
+	}
+}
+
+func (ui *AppUI) onScreenTap(x, y float32) {
+	if ui.client == nil {
+		return
+	}
+	ui.frameMu.Lock()
+	sw, sh := ui.sourceW, ui.sourceH
+	ui.frameMu.Unlock()
+	if sw <= 0 || sh <= 0 {
+		return
+	}
+	// Map click coordinates from widget size to device pixels
+	sz := ui.screenshotImg.Size()
+	if sz.Width <= 0 || sz.Height <= 0 {
+		return
+	}
+	// ImageFillContain: letterboxed
+	scale := float32(sw) / sz.Width
+	if float32(sh)/sz.Height < scale {
+		scale = float32(sh) / sz.Height
+	}
+	dw := float32(sw) / scale
+	dh := float32(sh) / scale
+	offX := (sz.Width - dw) / 2
+	offY := (sz.Height - dh) / 2
+	if x < offX || y < offY || x > offX+dw || y > offY+dh {
+		return
+	}
+	dx := int((x - offX) * scale)
+	dy := int((y - offY) * scale)
+	if dx < 0 {
+		dx = 0
+	}
+	if dy < 0 {
+		dy = 0
+	}
+	if dx >= sw {
+		dx = sw - 1
+	}
+	if dy >= sh {
+		dy = sh - 1
+	}
+	go func() {
+		if err := ui.client.Tap(dx, dy); err != nil {
+			ui.setStatus(err.Error())
+		} else {
+			ui.setStatus(fmt.Sprintf("Tap %d,%d", dx, dy))
+		}
+	}()
 }
 
 func (ui *AppUI) takeScreenshot() {
@@ -212,9 +408,14 @@ func (ui *AppUI) takeScreenshot() {
 			ui.setStatus("Decode failed: " + err.Error())
 			return
 		}
+		b := img.Bounds()
+		ui.frameMu.Lock()
+		ui.lastFrame = img
+		ui.sourceW, ui.sourceH = b.Dx(), b.Dy()
+		ui.frameMu.Unlock()
 		ui.screenshotImg.Image = img
 		ui.screenshotImg.Refresh()
-		ui.setStatus(fmt.Sprintf("Screenshot OK (%dx%d)", img.Bounds().Dx(), img.Bounds().Dy()))
+		ui.setStatus(fmt.Sprintf("Screenshot OK (%dx%d)", b.Dx(), b.Dy()))
 	}()
 }
 
@@ -239,6 +440,41 @@ func (ui *AppUI) saveScreenshot() {
 		ui.setStatus("Saved: " + uc.URI().Path())
 	}, ui.window)
 }
+
+// tappableImage wraps canvas.Image and reports clicks.
+type tappableImage struct {
+	widget.BaseWidget
+	img    *canvas.Image
+	onTap  func(x, y float32)
+}
+
+func newTappableImage(img *canvas.Image, onTap func(x, y float32)) *tappableImage {
+	t := &tappableImage{img: img, onTap: onTap}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *tappableImage) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(t.img)
+}
+
+func (t *tappableImage) Tapped(e *fyne.PointEvent) {
+	if t.onTap != nil {
+		t.onTap(e.Position.X, e.Position.Y)
+	}
+}
+
+func (t *tappableImage) TappedSecondary(*fyne.PointEvent) {}
+
+func (t *tappableImage) Cursor() desktop.Cursor {
+	return desktop.CrosshairCursor
+}
+
+func (t *tappableImage) MinSize() fyne.Size {
+	return t.img.MinSize()
+}
+
+// ---------- Control ----------
 
 func (ui *AppUI) buildControlTab() fyne.CanvasObject {
 	keys := container.NewGridWithColumns(3,
@@ -309,6 +545,8 @@ func (ui *AppUI) pressKey(code int) {
 	}()
 }
 
+// ---------- Apps ----------
+
 func (ui *AppUI) buildAppsTab() fyne.CanvasObject {
 	includeCheck := widget.NewCheck("Show system apps", func(v bool) {
 		ui.includeSystem = v
@@ -364,6 +602,8 @@ func (ui *AppUI) openSelectedApp() {
 		}
 	}()
 }
+
+// ---------- Files ----------
 
 func (ui *AppUI) buildFilesTab() fyne.CanvasObject {
 	ui.filePathEntry = widget.NewEntry()
@@ -552,6 +792,8 @@ func (ui *AppUI) fileMkdir() {
 	}, ui.window)
 }
 
+// ---------- APK ----------
+
 func (ui *AppUI) buildAPKTab() fyne.CanvasObject {
 	ui.apkPathEntry = widget.NewEntry()
 	ui.apkPathEntry.SetPlaceHolder("Path to .apk file")
@@ -669,6 +911,8 @@ func (ui *AppUI) doUninstall(keepData bool) {
 		}()
 	}, ui.window)
 }
+
+// ---------- Wi-Fi ----------
 
 func (ui *AppUI) buildWifiTab() fyne.CanvasObject {
 	ipEntry := widget.NewEntry()
