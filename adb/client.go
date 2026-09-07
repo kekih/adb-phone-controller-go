@@ -38,9 +38,15 @@ func AdbAvailable() bool {
 	return err == nil
 }
 
+func newCmd(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	hideWindow(cmd)
+	return cmd
+}
+
 // ListDevices returns connected devices (serial, state, model).
 func ListDevices() ([]Device, error) {
-	cmd := exec.Command("adb", "devices", "-l")
+	cmd := newCmd("adb", "devices", "-l")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("adb devices failed: %w (%s)", err, string(out))
@@ -79,7 +85,8 @@ func (c *Client) Raw(args []string, timeout time.Duration) (stdout, stderr strin
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	cmd := exec.Command(c.base()[0], append(c.base()[1:], args...)...)
+	cmdArgs := append(c.base()[1:], args...)
+	cmd := newCmd(c.base()[0], cmdArgs...)
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
@@ -97,7 +104,9 @@ func (c *Client) Raw(args []string, timeout time.Duration) (stdout, stderr strin
 		}
 		return strings.TrimSpace(outBuf.String()), strings.TrimSpace(errBuf.String()), 0
 	case <-time.After(timeout):
-		_ = cmd.Process.Kill()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		return "", "command timed out", -1
 	}
 }
@@ -155,7 +164,7 @@ func (c *Client) ScreenshotPNG(timeout time.Duration) ([]byte, error) {
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	cmd := exec.Command("adb", "-s", c.Serial, "exec-out", "screencap", "-p")
+	cmd := newCmd("adb", "-s", c.Serial, "exec-out", "screencap", "-p")
 	var outBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	var errBuf bytes.Buffer
@@ -175,7 +184,9 @@ func (c *Client) ScreenshotPNG(timeout time.Duration) ([]byte, error) {
 		}
 		return data, nil
 	case <-time.After(timeout):
-		_ = cmd.Process.Kill()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		return nil, fmt.Errorf("screencap timed out")
 	}
 }
@@ -244,7 +255,7 @@ func (c *Client) InputText(text string) error {
 
 // ConnectWifi connects to device over TCP/IP.
 func ConnectWifi(ipPort string) (string, error) {
-	cmd := exec.Command("adb", "connect", ipPort)
+	cmd := newCmd("adb", "connect", ipPort)
 	out, err := cmd.CombinedOutput()
 	msg := strings.TrimSpace(string(out))
 	if err != nil {
@@ -255,7 +266,7 @@ func ConnectWifi(ipPort string) (string, error) {
 
 // EnableTCPIP enables TCP/IP mode on the given serial.
 func EnableTCPIP(serial string, port int) (string, error) {
-	cmd := exec.Command("adb", "-s", serial, "tcpip", strconv.Itoa(port))
+	cmd := newCmd("adb", "-s", serial, "tcpip", strconv.Itoa(port))
 	out, err := cmd.CombinedOutput()
 	msg := strings.TrimSpace(string(out))
 	if err != nil {
@@ -309,7 +320,6 @@ func (c *Client) ListFiles(path string) ([]FileEntry, error) {
 			Name: name, IsDir: isDir, Size: size, Permissions: perms, Path: full,
 		})
 	}
-	// dirs first
 	for i := 0; i < len(items); i++ {
 		for j := i + 1; j < len(items); j++ {
 			if !items[i].IsDir && items[j].IsDir {
