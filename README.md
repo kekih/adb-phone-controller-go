@@ -3,41 +3,52 @@
 Cross-platform desktop GUI for controlling Android devices via ADB.
 Rewritten from the original Python/Tkinter version.
 
-## Features (current MVP)
+**Repository:** https://github.com/kekih/adb-phone-controller-go
+
+## Download (Windows .exe)
+
+1. Open **[Actions](https://github.com/kekih/adb-phone-controller-go/actions)**
+2. Open the latest successful **Build** run
+3. Download the artifact **`adb-phone-controller-windows-amd64`**
+4. Unzip and run `adb-phone-controller.exe`
+
+Or create a release yourself:
+- Push a tag: `git tag v0.1.0 && git push origin v0.1.0`
+- The workflow will attach the `.exe` to the GitHub Release automatically.
+
+## Features (v0.1.0)
 
 - Device discovery and selection (USB + Wi-Fi)
-- Device info (model, battery level/status)
+- Device info (model, battery)
 - Screenshot (view + save PNG)
-- Application list (user/system) + open app
-- Basic controls: Home / Back / Recent / Power, text input, coordinate tap
+- Application list + open app
+- Basic controls: Home / Back / Recent / Power / Volume, text input, coordinate tap
+- **File manager**: browse, download, upload, delete, create folder
+- **APK Manager**: install APK (with -r/-d/-g), uninstall packages
+- Wi-Fi ADB (tcpip + connect)
 - Dark theme
 
-More features (file manager, mirroring, permissions, logcat, batch ops...) will be added step by step.
+More features (monitoring, logcat, permissions, real-time mirroring...) coming step by step.
 
 ## Requirements
 
-- Go 1.22+
 - ADB (platform-tools) in PATH
-- On Linux: additional system packages for Fyne (see [Fyne docs](https://docs.fyne.io/started/))
+- USB debugging enabled on the phone
 
-## Build & Run
+## Build from source
 
 ```bash
+git clone https://github.com/kekih/adb-phone-controller-go.git
+cd adb-phone-controller-go
 go mod tidy
 go run .
 ```
 
-### Build Windows .exe
+### Windows .exe (on Windows with MinGW)
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o adb-phone-controller.exe .
+go build -ldflags="-s -w -H windowsgui" -o adb-phone-controller.exe .
 ```
-
-GitHub Actions automatically builds the Windows executable on every push to `main` and on releases.
-
-## Download
-
-Check the [Releases](https://github.com/kekih/adb-phone-controller-go/releases) or the Actions artifacts.
 
 ## License
 
